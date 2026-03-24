@@ -5,7 +5,9 @@ monster-siren.hypergryph.com, downloads audio/background/album art, and
 embeds tags (artist, album, cover) into the audio files.
 
 Usage (PowerShell):
-	python script.py
+	python script.py              # default: download everything (mode=all)
+	python script.py metadata     # download metadata only (no audio/images)
+	python script.py album <name_or_cid>  # download a specific album
 
 Dependencies:
 	pip install requests mutagen pydub
@@ -14,6 +16,7 @@ Dependencies:
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import re
@@ -23,6 +26,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from mutagen import File as MutagenFile
 from mutagen.flac import FLAC, Picture
 from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TALB, TIT2, TPE1, TRCK
@@ -291,99 +296,117 @@ def find_existing_track(album_dir: Path, idx: int, ext: str) -> Optional[Path]:
 	return None
 
 
-def main() -> None:
-	logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-	ensure_dirs()
-	session = requests.Session()
-	session.headers.update(HEADERS)
+def process_album(
+	session: requests.Session,
+	album_summary: Dict[str, Any],
+	*,
+	metadata_only: bool = False,
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], List[Tuple[str, Path]]]:
+	"""Process a single album: collect metadata and (optionally) queue downloads.
 
-	albums_payload = fetch_all_albums(session)
-	logging.info("Found %d albums", len(albums_payload))
+	Returns (album_record, song_records, download_tasks).
+	"""
+	album_id = str(
+		album_summary.get("cid")
+		or album_summary.get("id")
+		or album_summary.get("albumId")
+	)
+	if not album_id:
+		logging.warning("Skipping album with no id: %s", album_summary)
+		return None, [], []
 
-	albums_meta: List[Dict[str, Any]] = []
-	songs_meta: List[Dict[str, Any]] = []
+	detail = fetch_album_detail(session, album_id)
+	album_core = get_album_core(detail)
+	album_dir = build_album_dir(album_core)
+
 	download_tasks: List[Tuple[str, Path]] = []
 
-	for album_summary in albums_payload:
-		album_id = str(album_summary.get("cid") or album_summary.get("id") or album_summary.get("albumId"))
-		if not album_id:
-			logging.warning("Skipping album with no id: %s", album_summary)
-			continue
-
-		detail = fetch_album_detail(session, album_id)
-		album_core = get_album_core(detail)
-		album_dir = build_album_dir(album_core)
+	if not metadata_only:
 		album_dir.mkdir(parents=True, exist_ok=True)
 
-		cover_url = extract_album_cover(album_core)
-		bg_url = extract_background(album_core)
+	cover_url = extract_album_cover(album_core)
+	bg_url = extract_background(album_core)
 
-		cover_path = album_dir / "cover.jpg" if cover_url else None
-		bg_path = album_dir / "background.jpg" if bg_url else None
+	cover_path = album_dir / "cover.jpg" if cover_url else None
+	bg_path = album_dir / "background.jpg" if bg_url else None
 
+	if not metadata_only:
 		if cover_url and cover_path and not cover_path.exists():
 			download_tasks.append((cover_url, cover_path))
 		if bg_url and bg_path and not bg_path.exists():
 			download_tasks.append((bg_url, bg_path))
 
-		album_record = {
-			"id": album_id,
-			"name": album_core.get("name") or album_core.get("title"),
-			"artists": collect_artist_names(album_core),
-			"cover": str(cover_path.relative_to(ROOT)) if cover_path else None,
-			"background": str(bg_path.relative_to(ROOT)) if bg_path else None,
-			"raw": album_core,
-		}
-		albums_meta.append(album_record)
+	album_record = {
+		"id": album_id,
+		"name": album_core.get("name") or album_core.get("title"),
+		"artists": collect_artist_names(album_core),
+		"cover": str(cover_path.relative_to(ROOT)) if cover_path else None,
+		"background": str(bg_path.relative_to(ROOT)) if bg_path else None,
+		"raw": album_core,
+	}
 
-		songs_in_album = extract_album_songs(detail)
-		if not songs_in_album:
-			logging.warning("No songs listed for album %s", album_id)
+	songs_in_album = extract_album_songs(detail)
+	if not songs_in_album:
+		logging.warning("No songs listed for album %s", album_id)
+		return album_record, [], download_tasks
+
+	song_records: List[Dict[str, Any]] = []
+
+	for idx, song_stub in enumerate(songs_in_album, start=1):
+		song_id = str(
+			song_stub.get("cid") or song_stub.get("id") or song_stub.get("songId")
+		)
+		if not song_id:
+			logging.warning("Skipping song with no id in album %s", album_id)
 			continue
 
-		for idx, song_stub in enumerate(songs_in_album, start=1):
-			song_id = str(song_stub.get("cid") or song_stub.get("id") or song_stub.get("songId"))
-			if not song_id:
-				logging.warning("Skipping song with no id in album %s", album_id)
-				continue
+		song_detail = fetch_song_detail(session, song_id)
+		song_core = song_detail.get("song") if isinstance(song_detail, dict) else None
+		if not song_core:
+			song_core = song_detail if isinstance(song_detail, dict) else {}
 
-			song_detail = fetch_song_detail(session, song_id)
-			song_core = song_detail.get("song") if isinstance(song_detail, dict) else None
-			if not song_core:
-				song_core = song_detail if isinstance(song_detail, dict) else {}
+		audio_url = extract_song_audio(song_core)
+		if not audio_url:
+			logging.warning("No audio URL for song %s", song_id)
+			continue
 
-			audio_url = extract_song_audio(song_core)
-			if not audio_url:
-				logging.warning("No audio URL for song %s", song_id)
-				continue
+		ext = parse_extension_from_url(audio_url)
+		title = song_core.get("name") or song_core.get("title") or song_id
+		artists = collect_artist_names(song_core)
 
-			ext = parse_extension_from_url(audio_url)
-			title = song_core.get("name") or song_core.get("title") or song_id
-			artists = collect_artist_names(song_core)
+		filename = f"{idx:02d} - {slugify(title)}{ext}"
+		existing = find_existing_track(album_dir, idx, ext)
+		audio_path = existing or (album_dir / filename)
 
-			filename = f"{idx:02d} - {slugify(title)}{ext}"
-			existing = find_existing_track(album_dir, idx, ext)
-			audio_path = existing or (album_dir / filename)
+		if not metadata_only and not audio_path.exists():
+			download_tasks.append((audio_url, audio_path))
 
-			if not audio_path.exists():
-				download_tasks.append((audio_url, audio_path))
+		song_record = {
+			"id": song_id,
+			"albumId": album_id,
+			"title": title,
+			"artists": artists,
+			"trackNo": idx,
+			"path": str(audio_path.relative_to(ROOT)),
+			"coverPath": str(cover_path.relative_to(ROOT)) if cover_path else None,
+			"raw": song_core,
+		}
+		song_records.append(song_record)
 
-			song_record = {
-				"id": song_id,
-				"albumId": album_id,
-				"title": title,
-				"artists": artists,
-				"trackNo": idx,
-				"path": str(audio_path.relative_to(ROOT)),
-				"coverPath": str(cover_path.relative_to(ROOT)) if cover_path else None,
-				"raw": song_core,
-			}
-			songs_meta.append(song_record)
+	return album_record, song_records, download_tasks
 
+
+def run_downloads(
+	session: requests.Session, download_tasks: List[Tuple[str, Path]]
+) -> None:
+	"""Execute queued downloads in parallel."""
 	if download_tasks:
 		logging.info("Starting %d parallel downloads", len(download_tasks))
 		with ThreadPoolExecutor(max_workers=8) as executor:
-			future_map = {executor.submit(download_binary, session, url, dest): (url, dest) for url, dest in download_tasks}
+			future_map = {
+				executor.submit(download_binary, session, url, dest): (url, dest)
+				for url, dest in download_tasks
+			}
 			for future in as_completed(future_map):
 				url, dest = future_map[future]
 				try:
@@ -393,7 +416,11 @@ def main() -> None:
 	else:
 		logging.info("No downloads needed; assets already present")
 
-	# After all downloads finish, convert and tag.
+
+def post_process_songs(
+	albums_meta: List[Dict[str, Any]], songs_meta: List[Dict[str, Any]]
+) -> None:
+	"""Convert WAV to FLAC and embed tags into audio files."""
 	album_name_by_id = {a["id"]: a.get("name") or a["id"] for a in albums_meta}
 
 	for song in songs_meta:
@@ -423,6 +450,99 @@ def main() -> None:
 				cover_path,
 			)
 			song["flacPath"] = str(flac_path.relative_to(ROOT))
+
+
+def find_album_by_query(
+	albums_payload: List[Dict[str, Any]], query: str
+) -> Optional[Dict[str, Any]]:
+	"""Find an album by cid or name (case-insensitive substring match)."""
+	# Exact cid match first.
+	for a in albums_payload:
+		cid = str(a.get("cid") or a.get("id") or a.get("albumId") or "")
+		if cid == query:
+			return a
+	# Fallback: case-insensitive name substring.
+	query_lower = query.lower()
+	for a in albums_payload:
+		name = a.get("name") or a.get("title") or ""
+		if isinstance(name, str) and query_lower in name.lower():
+			return a
+	return None
+
+
+def parse_args() -> argparse.Namespace:
+	parser = argparse.ArgumentParser(
+		description="Download music from Monster Siren (monster-siren.hypergryph.com).",
+	)
+	subparsers = parser.add_subparsers(dest="mode", help="Operation mode")
+
+	# Default / "all" mode
+	subparsers.add_parser("all", help="Download everything (default)")
+
+	# Metadata-only mode
+	subparsers.add_parser("metadata", help="Download metadata only (no audio/images)")
+
+	# Single-album mode
+	album_parser = subparsers.add_parser("album", help="Download a specific album")
+	album_parser.add_argument(
+		"query",
+		help="Album name (substring match) or album cid",
+	)
+
+	args = parser.parse_args()
+	if args.mode is None:
+		args.mode = "all"
+	return args
+
+
+def main() -> None:
+	logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+	ensure_dirs()
+	args = parse_args()
+	session = requests.Session()
+	session.headers.update(HEADERS)
+	retry_strategy = Retry(
+		total=5,
+		backoff_factor=1,
+		status_forcelist=[429, 500, 502, 503, 504],
+	)
+	adapter = HTTPAdapter(max_retries=retry_strategy)
+	session.mount("https://", adapter)
+	session.mount("http://", adapter)
+
+	albums_payload = fetch_all_albums(session)
+	logging.info("Found %d albums", len(albums_payload))
+
+	metadata_only = args.mode == "metadata"
+
+	# Determine which albums to process.
+	if args.mode == "album":
+		match = find_album_by_query(albums_payload, args.query)
+		if match is None:
+			logging.error("No album found matching '%s'", args.query)
+			return
+		match_name = match.get("name") or match.get("title") or match.get("cid")
+		logging.info("Matched album: %s", match_name)
+		target_albums = [match]
+	else:
+		target_albums = albums_payload
+
+	albums_meta: List[Dict[str, Any]] = []
+	songs_meta: List[Dict[str, Any]] = []
+	all_downloads: List[Tuple[str, Path]] = []
+
+	for album_summary in target_albums:
+		album_record, song_records, download_tasks = process_album(
+			session, album_summary, metadata_only=metadata_only
+		)
+		if album_record:
+			albums_meta.append(album_record)
+		songs_meta.extend(song_records)
+		all_downloads.extend(download_tasks)
+
+	if not metadata_only:
+		run_downloads(session, all_downloads)
+		post_process_songs(albums_meta, songs_meta)
 
 	save_json(METADATA_DIR / "albums.json", albums_meta)
 	save_json(METADATA_DIR / "songs.json", songs_meta)
